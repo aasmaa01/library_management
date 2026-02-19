@@ -1,6 +1,26 @@
 import 'dart:async';
 import 'dart:isolate';
 import 'dart:io';
+//we have local library.!
+//The librarian needs to manage books
+/*
+What owns the StreamController?
+
+Where does the Isolate get triggered?
+
+Who throws exceptions?
+
+Who catches them?
+
+Who converts objects to Map?
+ */
+//Manage books - books i think ndirhom f Map<int, Book>
+
+//Manage members (people who borrow books)
+
+//Track loans (borrowed books)
+
+//Handle reservations (books held for members)
 
 //enums ~ Book status (available, borrowed, reserved) ~ Member status (active, inactive) ~ Loan status (active, overdue, returned) ~ Reservation status (active, fulfilled, cancelled)
 
