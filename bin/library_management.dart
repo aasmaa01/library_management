@@ -240,7 +240,8 @@ class LibraryManager {
 
   void _emit(String event) {
     //internal method to add events to the stream
-    _activityController.add('Activity:\u{1F4DD}} $event');
+    // FIX: removed extra } from \u{1F4DD}}
+    _activityController.add('Activity:\u{1F4DD} $event');
   }
 
   Future<void> _dbDelay() => Future.delayed(
@@ -351,13 +352,15 @@ class LibraryManager {
     // ENUM used in a conditional — satisfies "used in a conditional" requirement
     if (member.tier != MemberTier.premium) {
       throw MemberLimitExcp(
-          'Only premium members can reserve books. '
-          '${member.name} has a standard account.');
+        'Only premium members can reserve books. '
+        '${member.name} has a standard account.',
+      );
     }
 
     if (book.status != BookStatus.available) {
       throw AlreadyLoanedExcp(
-          '"${book.title}" is not available for reservation.');
+        '"${book.title}" is not available for reservation.',
+      );
     }
 
     book.status = BookStatus.reserved;
@@ -370,6 +373,7 @@ class LibraryManager {
 
     _emit('Book reserved: "${book.title}" for ${member.name}');
   }
+
   //Member operations
   Future<void> addMember(Member member) async {
     await _dbDelay();
@@ -386,18 +390,23 @@ class LibraryManager {
     await _dbDelay();
     return _members.values.toList();
   }
+
   // tdi function as a parameter.
   // Caller decides the filter logic; manager just applies it.
   Future<List<Book>> filterBooks(bool Function(Book) test) async {
     await _dbDelay();
-    return _books.values.where(test).toList();//.where() with a passed-in callback
+    return _books.values
+        .where(test)
+        .toList(); //.where() with a passed-in callback
   }
 
   // .where() — filter available books
   Future<List<Book>> getAvailableBooks() async {
     await _dbDelay();
     return _books.values
-        .where((b) => b.status == BookStatus.available)// anonymous function as a callback to .where()
+        .where(
+          (b) => b.status == BookStatus.available,
+        ) // anonymous function as a callback to .where()
         .toList();
   }
 
@@ -422,7 +431,7 @@ class LibraryManager {
     if (_loans.isEmpty) return 0;
     return _loans
         .map((l) => l.isReturned ? 0 : 1) // .map() → 0 or 1
-        .reduce((sum, val) => sum + val);  // .reduce() → total
+        .reduce((sum, val) => sum + val); // .reduce() → total
   }
 
   // .forEach() with an anonymous function
@@ -431,50 +440,335 @@ class LibraryManager {
       print('  No loans recorded yet.');
       return;
     }
-    _loans.forEach((loan) {//anonymous function passed to forEach
+    _loans.forEach((loan) {
+      //anonymous function passed to forEach
       print('  ${loan.summary}');
     });
   }
 
+  //→ isolate search
+  Future<List<Book>> searchCatalog(String query) async {
+    _emit('Starting catalog search for "$query" in Isolate...');
+
+    // CRITICAL: Cannot send Book instances through a SendPort
+    final booksData = _books.values.map((b) => b.toMap()).toList();
+
+    //Create a ReceivePort on the main thread
+    final receivePort = ReceivePort();
+
+    // catalogSearchWorker must be a TOP-LEVEL function (not a method)
+    // We pass the sendPort so the isolate can talk back to us
+    await Isolate.spawn(catalogSearchWorker, receivePort.sendPort);
+
+    // Step 4: Use a Completer to bridge the callback-based port
+    // into a Future that we can await.
+    final completer = Completer<List<Map<String, dynamic>>>();
+
+    // The isolate first sends us ITS sendPort so we can send it data.
+    late SendPort isolateSendPort;
+
+    receivePort.listen((message) {
+      if (message is SendPort) {
+        // First message: the isolate's own SendPort.
+        isolateSendPort = message;
+        // Now we send the search data to the isolate.
+        isolateSendPort.send({'books': booksData, 'query': query});
+      } else if (message is List) {
+        // Second message: the search results (list of plain Maps).
+        completer.complete(List<Map<String, dynamic>>.from(message));
+        receivePort.close(); // clean up
+      }
+    });
+
+    // Await the Completer's Future.
+    final resultMaps = await completer.future;
+
+    //Reconstruct Book objects from the plain Maps.
+    final results = resultMaps.map(Book.fromMap).toList();
+    //method tear-off — equivalent to (m) => Book.fromMap(m)
+
+    _emit('Isolate search complete: ${results.length} result(s) for "$query"');
+    return results;
+  }
 }
-
-
-
 
 //→ isolate worker
 
+void catalogSearchWorker(SendPort callerSendPort) {
+  //Create our own ReceivePort so the main thread can send us data.
+  final workerReceivePort = ReceivePort();
+
+  // Send our SendPort back to the main thread.
+  callerSendPort.send(workerReceivePort.sendPort);
+
+  //Listen for the search request.
+  workerReceivePort.listen((message) {
+    if (message is Map) {
+      final booksData = List<Map<String, dynamic>>.from(
+        message['books'] as List,
+      );
+      final query = (message['query'] as String).toLowerCase();
+
+      //Perform the search on plain Map data.
+      // We cannot use Book.matches() here — no class instances!
+      final results = booksData.where((bookMap) {
+        final title = (bookMap['title'] as String).toLowerCase();
+        final author = (bookMap['author'] as String).toLowerCase();
+        return title.contains(query) || author.contains(query);
+      }).toList();
+
+      //Send results back to the main thread.
+      callerSendPort.send(results);
+
+      //Close our port — we're done.
+      workerReceivePort.close();
+    }
+  });
+}
+
 //→ helpers
+
+// Arrow function — single expression, no braces needed.
+String statusIcon(BookStatus status) => switch (status) {
+  BookStatus.available => '\u2713', //  ✓
+  BookStatus.loaned => '\u2717', //  ✗
+  BookStatus.reserved => '\u23F3', //  ⏳
+};
+
+// Named parameters with default value.
+void printDivider({int width = 55, String char = '─'}) {
+  print(char * width);
+}
+
+// Higher-order function — takes a label and a function, runs it.
+// This satisfies the "at least one higher-order function" requirement.
+Future<void> withLoadingIndicator(
+  String label,
+  Future<void> Function() action,
+) async {
+  stdout.write('  $label...');
+  await action();
+  print(' Done!');
+}
+
+// Prompt helper — reads a line, returns empty string if null.
+// Uses ?? (null-coalescing) to handle null from readLineSync.
+String prompt(String message) {
+  stdout.write('  $message: ');
+  return stdin.readLineSync() ?? '';
+}
+
+void printBookDetails(Book book) {
+  printDivider();
+  print('  ${statusIcon(book.status)} ${book.details}');
+}
+
+void _printMenu() {
+  printDivider();
+  print('  1. Add Book');
+  print('  2. List All Books');
+  print('  3. Loan Book');
+  print('  4. Return Book');
+  print('  5. Reserve Book');
+  print('  6. Search Catalog');
+  print('  7. List Members');
+  print('  8. Add Member');
+  print('  0. Exit');
+  printDivider();
+}
+
+//add book
+Future<void> _addBook(LibraryManager manager) async {
+  final id = prompt('Book ID');
+  final title = prompt('Title');
+  final author = prompt('Author');
+  final desc = prompt('Description (optional)');
+  final genresInput = prompt('Genres (comma-separated)');
+  final genres = genresInput.split(',').map((g) => g.trim()).toSet();
+  final book = Book(id, title, author, description: desc, genres: genres);
+  await withLoadingIndicator('Adding book', () => manager.addBook(book));
+  print('Book added successfully!');
+}
+
+Future<void> _listBooks(LibraryManager manager) async {
+  final books = await manager.getAllBooks();
+  if (books.isEmpty) {
+    print('  No books in the library.');
+    return;
+  }
+  for (final book in books) {
+    printBookDetails(book);
+  }
+}
+
+Future<void> _findBook(LibraryManager manager) async {
+  final id = prompt('Book ID');
+  final book = await manager.findBook(id);
+  printBookDetails(book);
+}
+
+Future<void> _loanBook(LibraryManager manager) async {
+  final bookId = prompt('Book ID');
+  final memberId = prompt('Member ID');
+  await withLoadingIndicator('Loaning book', () => manager.loanBook(bookId, memberId));
+  print('Book loaned successfully!');
+}
+
+Future<void> _returnBook(LibraryManager manager) async {
+  final bookId = prompt('Book ID');
+  await withLoadingIndicator('Returning book', () => manager.returnBook(bookId));
+  print('Book returned successfully!');
+}
+
+Future<void> _reserveBook(LibraryManager manager) async {
+  final bookId = prompt('Book ID');
+  final memberId = prompt('Member ID');
+  await withLoadingIndicator('Reserving book', () => manager.reserveBook(bookId, memberId));
+  print('Book reserved successfully!');
+}
+
+Future<void> _searchBooks(LibraryManager manager) async {
+  final query = prompt('Search your books by title or author');
+  final results = await manager.searchCatalog(query);
+  if (results.isEmpty) {
+    print('  No books found.');
+    return;
+  }
+  for (final book in results) {
+    printBookDetails(book);
+  }
+}
+
+Future<void> _listMembers(LibraryManager manager) async {
+  final members = await manager.getAllMembers();
+  if (members.isEmpty) {
+    print('  No members registered.');
+    return;
+  }
+  for (final member in members) {
+    print('  ${member.contactInfo}');
+  }
+}
+
+Future<void> _addMember(LibraryManager manager) async {
+  final id = prompt('Member ID');
+  final name = prompt('Member Name');
+  final email = prompt('Email');
+  final tierInput = prompt('Tier (standard/premium)');
+
+  final tier = tierInput.toLowerCase() == 'premium'
+      ? MemberTier.premium
+      : MemberTier.standard;
+  final member = Member(id, name, email, tier);
+  await withLoadingIndicator('Adding member', () => manager.addMember(member));
+  print('Member added successfully!');
+}
+
+//→ seed data
+Future<void> _seedData(LibraryManager manager) async {
+  await manager.addBook(
+    Book(
+      'B001',
+      'Murder on the Orient Express',
+      'Agatha Christie',
+      genres: {'Mystery', 'Crime'},
+    ),
+  );
+  await manager.addBook(
+    Book(
+      'B002',
+      'The Alchemist',
+      'Paulo Coelho',
+      genres: {'Fiction', 'Adventure'},
+    ),
+  );
+  await manager.addBook(
+    Book( //agatha christire novals
+      'B003',
+      'The Da Vinci Code',
+      'Dan Brown',
+      genres: {'Mystery', 'Thriller'},
+    ),
+  );
+  await manager.addBook(
+    Book(
+      'B004',
+      'Charlock Holmes',
+      'Arthur Conan Doyle',
+      genres: {'Mystery', 'Crime'},
+    ),
+  );
+  await manager.addMember(
+    Member(
+      'M001',
+      'Asma Soltani',
+      'asmaesoltaniii@gmail.com',
+      MemberTier.premium,
+    ),
+  );
+  await manager.addMember(
+    Member(
+      'M002',
+      'John Doe',
+      'johndoe@example.com',
+      MemberTier.standard,
+    ),
+  ); // FIX: added missing semicolon
+  print('✓ Sample data loaded!');
+} // FIX: added missing closing brace
 
 //→ main() async menu loop
 
 void main() async {
   print('Welcome to the Library Management System! ');
+  final activityController = StreamController<String>.broadcast();
+  // Listen to activity stream and print events.
+
+  final logSubscription = activityController.stream.listen((event) {
+    //anonymous function as a callback to listen()
+    print('  \u{1F4DD} $event');
+  });
+  //we inject the controller into the manager so it can emit events
+  final manager = LibraryManager(activityController);
+
+  await _seedData(manager);
+  //menu loop
+  print('Type a number to choose an option:');
   var running = true;
-  while (running) {}
-  //Map<String, dynamic>
-  //DATA — Books in Map, Loans in List, Members in Map
+  while (running) {
+    _printMenu();
+    final choice = prompt('Enter your choice');
+    try {
+      final choice_int = int.parse(choice);
+      switch (choice_int) {
+        case 1:
+          await _addBook(manager);
+        case 2:
+          await _listBooks(manager);
+        case 3:
+          await _loanBook(manager);
+        case 4:
+          await _returnBook(manager);
+        case 5:
+          await _reserveBook(manager);
+        case 6:
+          await _searchBooks(manager);
+        case 7:
+          await _listMembers(manager);
+        case 8:
+          await _addMember(manager);
+        case 0:
+          print('Exiting... Goodbye!');
+          running = false;
+        default:
+          print('Invalid choice, please try again.');
+      }
+    } catch (e) {
+      print('  Error: $e');
+      printDivider();
+    }
+  }
 
-  //menu options : add/update/find/delete book, loans, members, reservations
+  await logSubscription.cancel();
+  await activityController.close();
 }
- 
-
- /*
- Domain Layer
-  - Enums
-  - Exceptions
-  - Abstract base
-  - Mixins
-  - Entities
-
-Application Layer
-  - LibraryManager
-  - Repository logic
-
-Infrastructure Layer
-  - Stream logging
-  - Isolate worker
-
-Presentation Layer
-  - Console menu
-
-  */
